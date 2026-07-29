@@ -63,6 +63,13 @@ pub const PLATFORM_ANDROID: &str = "Android";
 pub const TIMER_OUT: Duration = Duration::from_secs(1);
 pub const DEFAULT_KEEP_ALIVE: i32 = 60_000;
 
+/// Private control value carried in the existing server-to-client
+/// `follow_current_display` field. Normal display indexes are non-negative.
+///
+/// Reusing the established field keeps this safety control compatible with the
+/// existing wire schema while both custom desktop peers are upgraded.
+pub const RETURN_TO_PRIMARY_DISPLAY_SENTINEL: i32 = i32::MIN;
+
 const MIN_VER_MULTI_UI_SESSION: &str = "1.2.4";
 
 pub mod input {
@@ -79,10 +86,15 @@ pub mod input {
     /// 2. Lack of pointer lock API in Sciter/TIS
     /// 3. No OS cursor control (hide/show/clip) FFI bindings in Sciter UI
     pub const MOUSE_TYPE_MOVE_RELATIVE: i32 = 5;
+    /// Ends relative mouse mode without injecting an absolute pointer move.
+    ///
+    /// This explicit wire marker prevents a focus-generated absolute frame from
+    /// being mistaken for an intentional mode exit.
+    pub const MOUSE_TYPE_RELATIVE_MODE_OFF: i32 = 6;
 
     /// Mask to extract the mouse event type from the mask field.
     /// The lower 3 bits contain the event type (MOUSE_TYPE_*), giving a valid range of 0-7.
-    /// Currently defined types use values 0-5; values 6 and 7 are reserved for future use.
+    /// Currently defined types use values 0-6; value 7 is reserved for future use.
     pub const MOUSE_TYPE_MASK: i32 = 0x7;
 
     pub const MOUSE_BUTTON_LEFT: i32 = 0x01;
@@ -2988,6 +3000,7 @@ mod tests {
             MOUSE_TYPE_WHEEL,
             MOUSE_TYPE_TRACKPAD,
             MOUSE_TYPE_MOVE_RELATIVE,
+            MOUSE_TYPE_RELATIVE_MODE_OFF,
         ];
 
         let mut seen = std::collections::HashSet::new();

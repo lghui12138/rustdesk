@@ -96,6 +96,7 @@ const CONFIG_SYNC_INITIAL_WAIT_SECS: u64 = 3;
 
 lazy_static::lazy_static! {
     pub static ref CHILD_PROCESS: Childs = Default::default();
+    static ref HOST_SERVER: RwLock<ServerPtrWeak> = RwLock::new(Weak::new());
     // A client server used to provide local services(audio, video, clipboard, etc.)
     // for all initiative connections.
     //
@@ -163,6 +164,43 @@ pub fn new() -> ServerPtr {
     }
     // Terminal service is created per connection, not globally
     Arc::new(RwLock::new(server))
+}
+
+pub(crate) fn register_host_server(server: &ServerPtr) {
+    *HOST_SERVER.write().unwrap() = Arc::downgrade(server);
+}
+
+/// Asks every active relative controller to release capture and return the
+/// host pointer to its primary display.
+///
+/// The callback is synchronous only up to each connection's non-blocking send
+/// queue. It starts the stale-delta gate before enqueueing the control message.
+#[cfg(target_os = "macos")]
+pub(crate) fn request_return_to_primary_display() -> usize {
+    let Some(server) = HOST_SERVER.read().unwrap().upgrade() else {
+        log::warn!("Return-to-primary shortcut fired before host server registration");
+        return 0;
+    };
+
+    let mut misc = Misc::new();
+    misc.set_follow_current_display(crate::common::RETURN_TO_PRIMARY_DISPLAY_SENTINEL);
+    let mut message = Message::new();
+    message.set_misc(misc);
+    let message = Arc::new(message);
+
+    let mut notified = 0;
+    let mut server = server.write().unwrap();
+    for (id, connection) in server.connections.iter_mut() {
+        if input_service::block_relative_mouse_until_mode_off(*id) {
+            connection.send(message.clone());
+            notified += 1;
+        }
+    }
+    log::info!(
+        "Return-to-primary shortcut notified {} active relative session(s)",
+        notified
+    );
+    notified
 }
 
 async fn accept_connection_(
@@ -513,13 +551,10 @@ impl Server {
 
     #[cfg(target_os = "macos")]
     fn update_enable_retina(&self) {
-        let mut video_service_count = 0;
-        for (name, service) in self.services.iter() {
-            if Self::is_video_service_name(&name) && service.ok() {
-                video_service_count += 1;
-            }
-        }
-        *scrap::quartz::ENABLE_RETINA.lock().unwrap() = video_service_count < 2;
+        // Keep every selected display at its native HiDPI framebuffer. Reducing
+        // all captures to logical resolution when a second monitor is streamed
+        // makes multi-receiver text visibly soft.
+        *scrap::quartz::ENABLE_RETINA.lock().unwrap() = true;
     }
 }
 
@@ -588,6 +623,12 @@ pub async fn start_server(is_server: bool, no_server: bool) {
 
     if is_server {
         crate::common::set_server_running(true);
+        #[cfg(target_os = "macos")]
+        if crate::common::is_server()
+            && !crate::platform::macos::install_return_to_primary_display_shortcut()
+        {
+            log::warn!("Failed to install the return-to-primary display shortcut");
+        }
         std::thread::spawn(move || {
             if let Err(err) = crate::ipc::start("") {
                 log::error!("Failed to start ipc: {}", err);

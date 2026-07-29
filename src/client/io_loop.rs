@@ -2009,7 +2009,11 @@ impl<T: InvokeUiSession> Remote<T> {
                         self.handler.lc.write().unwrap().supported_encoding = e;
                     }
                     Some(misc::Union::FollowCurrentDisplay(d_idx)) => {
-                        self.handler.set_current_display(d_idx);
+                        if d_idx == crate::common::RETURN_TO_PRIMARY_DISPLAY_SENTINEL {
+                            self.handler.return_to_primary_display();
+                        } else {
+                            self.handler.set_current_display(d_idx);
+                        }
                     }
                     _ => {}
                 },

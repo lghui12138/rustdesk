@@ -455,6 +455,9 @@ lazy_static::lazy_static! {
     // Track connections that are currently using relative mouse movement.
     // Used to disable whiteboard/cursor display for all events while in relative mode.
     static ref RELATIVE_MOUSE_CONNS: Arc<Mutex<std::collections::HashSet<i32>>> = Default::default();
+    // A local return-to-primary request blocks stale relative frames until the
+    // controlling peer acknowledges it with the explicit mode-off marker.
+    static ref RETURN_TO_PRIMARY_PENDING_CONNS: Arc<Mutex<std::collections::HashSet<i32>>> = Default::default();
 }
 
 #[cfg(target_os = "linux")]
@@ -470,12 +473,51 @@ fn set_relative_mouse_active(conn: i32, active: bool) {
         lock.insert(conn);
     } else {
         lock.remove(&conn);
+        RETURN_TO_PRIMARY_PENDING_CONNS
+            .lock()
+            .unwrap()
+            .remove(&conn);
     }
 }
 
+/// Marks a connection as using relative input without injecting a mouse event.
+///
+/// macOS uses a zero-delta relative event as a session activation control
+/// marker. The connection layer consumes that marker so it cannot race the
+/// absolute display-activation move, but the cursor/whiteboard state still
+/// needs to enter relative mode before the first real delta arrives.
+#[cfg(target_os = "macos")]
 #[inline]
-fn is_relative_mouse_active(conn: i32) -> bool {
+pub(crate) fn mark_relative_mouse_active(conn: i32) {
+    set_relative_mouse_active(conn, true);
+}
+
+#[inline]
+pub(crate) fn is_relative_mouse_active(conn: i32) -> bool {
     RELATIVE_MOUSE_CONNS.lock().unwrap().contains(&conn)
+}
+
+/// Blocks further mouse input from an active relative session until its
+/// explicit mode-off acknowledgement arrives.
+///
+/// The lock order matches `set_relative_mouse_active(false)`, so a concurrent
+/// mode-off cannot leave a connection permanently pending.
+#[inline]
+pub(crate) fn block_relative_mouse_until_mode_off(conn: i32) -> bool {
+    let relative = RELATIVE_MOUSE_CONNS.lock().unwrap();
+    if !relative.contains(&conn) {
+        return false;
+    }
+    RETURN_TO_PRIMARY_PENDING_CONNS.lock().unwrap().insert(conn);
+    true
+}
+
+#[inline]
+fn is_return_to_primary_pending(conn: i32) -> bool {
+    RETURN_TO_PRIMARY_PENDING_CONNS
+        .lock()
+        .unwrap()
+        .contains(&conn)
 }
 
 /// Clears the relative mouse mode state for a connection.
@@ -1045,6 +1087,9 @@ pub fn handle_mouse_(
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
         let evt_type = evt.mask & MOUSE_TYPE_MASK;
+        if evt_type == MOUSE_TYPE_RELATIVE_MODE_OFF {
+            return;
+        }
         // Relative (delta) mouse events do not include absolute coordinates, so
         // whiteboard/cursor rendering must be disabled during relative mode to prevent
         // incorrect cursor/whiteboard updates. We check both is_relative_mouse_active(conn)
@@ -1067,8 +1112,24 @@ pub fn handle_mouse_simulation_(evt: &MouseEvent, conn: i32) {
 
     #[cfg(windows)]
     crate::platform::windows::try_change_desktop();
-    let buttons = evt.mask >> 3;
     let evt_type = evt.mask & MOUSE_TYPE_MASK;
+    if evt_type == MOUSE_TYPE_RELATIVE_MODE_OFF {
+        set_relative_mouse_active(conn, false);
+        return;
+    }
+    // A host-side return request is authoritative. Ignore every stale mouse
+    // frame from this relative session until the ordered mode-off marker
+    // arrives; the following absolute primary-center move is then accepted.
+    if is_return_to_primary_pending(conn) {
+        return;
+    }
+    // An active relative session can only return to absolute movement through
+    // the explicit mode-off marker above. Fullscreen focus and cursor warps can
+    // otherwise leak a normal MOVE frame and snap the peer to a screen edge.
+    if evt_type == MOUSE_TYPE_MOVE && is_relative_mouse_active(conn) {
+        return;
+    }
+    let buttons = evt.mask >> 3;
     let mut en = ENIGO.lock().unwrap();
     #[cfg(target_os = "macos")]
     en.set_ignore_flags(enigo_ignore_flags());
@@ -1096,8 +1157,6 @@ pub fn handle_mouse_simulation_(evt: &MouseEvent, conn: i32) {
     }
     match evt_type {
         MOUSE_TYPE_MOVE => {
-            // Switching back to absolute movement implicitly disables relative mouse mode.
-            set_relative_mouse_active(conn, false);
             en.mouse_move_to(evt.x, evt.y);
             *LATEST_PEER_INPUT_CURSOR.lock().unwrap() = Input {
                 conn,
@@ -1111,6 +1170,13 @@ pub fn handle_mouse_simulation_(evt: &MouseEvent, conn: i32) {
         // Multiple clients can mix absolute and relative movements without conflict,
         // as the server simply applies the delta to the current cursor position.
         MOUSE_TYPE_MOVE_RELATIVE => {
+            const RELATIVE_MOUSE_MODE_OFF_SENTINEL: i32 = i32::MIN;
+            if evt.x == RELATIVE_MOUSE_MODE_OFF_SENTINEL
+                && evt.y == RELATIVE_MOUSE_MODE_OFF_SENTINEL
+            {
+                set_relative_mouse_active(conn, false);
+                return;
+            }
             set_relative_mouse_active(conn, true);
             // Clamp delta to prevent extreme/malicious values from reaching OS APIs.
             // This matches the Flutter client's kMaxRelativeMouseDelta constant.
@@ -1121,6 +1187,21 @@ pub fn handle_mouse_simulation_(evt: &MouseEvent, conn: i32) {
             let dy = evt
                 .y
                 .clamp(-MAX_RELATIVE_MOUSE_DELTA, MAX_RELATIVE_MOUSE_DELTA);
+            #[cfg(target_os = "macos")]
+            {
+                const MAX_ACCEPTED_RELATIVE_MOUSE_FRAME_DELTA: u32 = 512;
+                if dx.unsigned_abs() > MAX_ACCEPTED_RELATIVE_MOUSE_FRAME_DELTA
+                    || dy.unsigned_abs() > MAX_ACCEPTED_RELATIVE_MOUSE_FRAME_DELTA
+                {
+                    log::warn!(
+                        "Discarded implausible relative mouse frame: conn={}, dx={}, dy={}",
+                        conn,
+                        dx,
+                        dy
+                    );
+                    return;
+                }
+            }
             en.mouse_move_relative(dx, dy);
             // Get actual cursor position after relative movement for tracking
             if let Some((x, y)) = crate::get_cursor_pos() {

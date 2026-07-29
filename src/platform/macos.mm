@@ -11,6 +11,8 @@
 #include <mutex>
 #include <string>
 
+extern "C" int32_t RustDeskReturnToPrimaryDisplayShortcut();
+
 extern "C" bool CanUseNewApiForScreenCaptureCheck() {
     #ifdef NO_InputMonitoringAuthStatus
     return false;
@@ -302,6 +304,8 @@ extern "C" bool MacSetMode(CGDirectDisplayID display, uint32_t width, uint32_t h
 
 static CFMachPortRef g_eventTap = NULL;
 static CFRunLoopSourceRef g_runLoopSource = NULL;
+static CFMachPortRef g_returnToPrimaryEventTap = NULL;
+static CFRunLoopSourceRef g_returnToPrimaryRunLoopSource = NULL;
 static std::mutex g_privacyModeMutex;
 static bool g_privacyModeActive = false;
 
@@ -328,6 +332,134 @@ static std::map<std::string, std::vector<CGGammaValue>> g_originalGammas;
 // This allows us to distinguish remote input (which should be allowed) from local physical input.
 // See: libs/enigo/src/macos/macos_impl.rs - ENIGO_INPUT_EXTRA_VALUE
 static const int64_t ENIGO_INPUT_EXTRA_VALUE = 100;
+
+static void ReturnPointerToPrimaryDisplayCenter() {
+    CGRect bounds = CGDisplayBounds(CGMainDisplayID());
+    if (CGRectIsNull(bounds) ||
+        CGRectIsEmpty(bounds)) {
+        return;
+    }
+    CGPoint center = CGPointMake(
+        CGRectGetMidX(bounds),
+        CGRectGetMidY(bounds)
+    );
+    CGError associationResult =
+        CGAssociateMouseAndMouseCursorPosition(true);
+    CGError warpResult = CGWarpMouseCursorPosition(center);
+    if (associationResult != kCGErrorSuccess ||
+        warpResult != kCGErrorSuccess) {
+        NSLog(
+            @"Return-to-primary shortcut failed: associate=%d warp=%d",
+            associationResult,
+            warpResult
+        );
+    }
+}
+
+static CGEventRef ReturnToPrimaryDisplayEventTapCallback(
+    CGEventTapProxy proxy,
+    CGEventType type,
+    CGEventRef event,
+    void *refcon
+) {
+    (void)proxy;
+    (void)refcon;
+
+    if (type == kCGEventTapDisabledByTimeout ||
+        type == kCGEventTapDisabledByUserInput) {
+        if (g_returnToPrimaryEventTap) {
+            CGEventTapEnable(g_returnToPrimaryEventTap, true);
+        }
+        return event;
+    }
+    if (type != kCGEventKeyDown) {
+        return event;
+    }
+
+    static const CGKeyCode kHKeyCode = 4;
+    CGKeyCode keyCode = (CGKeyCode)CGEventGetIntegerValueField(
+        event,
+        kCGKeyboardEventKeycode
+    );
+    int64_t isAutoRepeat = CGEventGetIntegerValueField(
+        event,
+        kCGKeyboardEventAutorepeat
+    );
+    CGEventFlags requiredFlags =
+        kCGEventFlagMaskControl | kCGEventFlagMaskCommand;
+    CGEventFlags flags = CGEventGetFlags(event);
+    if (keyCode != kHKeyCode ||
+        isAutoRepeat != 0 ||
+        (flags & requiredFlags) != requiredFlags) {
+        return event;
+    }
+
+    int32_t notified = RustDeskReturnToPrimaryDisplayShortcut();
+    int64_t delay = notified > 0 ? 250 * NSEC_PER_MSEC : 0;
+    dispatch_after(
+        dispatch_time(DISPATCH_TIME_NOW, delay),
+        dispatch_get_main_queue(),
+        ^{
+            // The host has already gated stale relative frames. Recenter after
+            // one LAN round trip so the client's ordered mode-off is applied
+            // before the final physical pointer position is committed.
+            ReturnPointerToPrimaryDisplayCenter();
+        }
+    );
+    return event;
+}
+
+extern "C" bool MacInstallReturnToPrimaryDisplayShortcut() {
+    __block bool success = false;
+    void (^setupBlock)(void) = ^{
+        if (g_returnToPrimaryEventTap) {
+            success = true;
+            return;
+        }
+        CGEventMask eventMask = CGEventMaskBit(kCGEventKeyDown);
+        g_returnToPrimaryEventTap = CGEventTapCreate(
+            kCGSessionEventTap,
+            kCGHeadInsertEventTap,
+            kCGEventTapOptionListenOnly,
+            eventMask,
+            ReturnToPrimaryDisplayEventTapCallback,
+            NULL
+        );
+        if (!g_returnToPrimaryEventTap) {
+            NSLog(
+                @"Could not install return-to-primary shortcut event tap."
+            );
+            return;
+        }
+        g_returnToPrimaryRunLoopSource = CFMachPortCreateRunLoopSource(
+            kCFAllocatorDefault,
+            g_returnToPrimaryEventTap,
+            0
+        );
+        if (!g_returnToPrimaryRunLoopSource) {
+            CFRelease(g_returnToPrimaryEventTap);
+            g_returnToPrimaryEventTap = NULL;
+            NSLog(
+                @"Could not create return-to-primary shortcut run-loop source."
+            );
+            return;
+        }
+        CFRunLoopAddSource(
+            CFRunLoopGetMain(),
+            g_returnToPrimaryRunLoopSource,
+            kCFRunLoopCommonModes
+        );
+        CGEventTapEnable(g_returnToPrimaryEventTap, true);
+        success = true;
+    };
+
+    if ([NSThread isMainThread]) {
+        setupBlock();
+    } else {
+        dispatch_sync(dispatch_get_main_queue(), setupBlock);
+    }
+    return success;
+}
 
 // Duration in milliseconds to monitor and enforce blackout after display reconfiguration.
 // macOS may restore default gamma (via ColorSync) at unpredictable times after display changes,

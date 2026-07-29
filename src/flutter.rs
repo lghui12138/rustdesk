@@ -693,6 +693,10 @@ impl InvokeUiSession for FlutterHandler {
         );
     }
 
+    fn return_to_primary_display(&self) {
+        self.push_event::<&str>("return_to_primary_display", &[], &[]);
+    }
+
     /// unused in flutter, use switch_display or set_peer_info
     fn set_display(&self, _x: i32, _y: i32, _w: i32, _h: i32, _cursor_embedded: bool, _scale: f64) {}
 

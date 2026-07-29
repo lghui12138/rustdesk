@@ -2854,7 +2854,47 @@ impl Connection {
                             MOUSE_MOVE_TIME.store(get_time(), Ordering::SeqCst);
                         }
                         #[cfg(target_os = "macos")]
+                        let relative_activation_marker = is_relative_activation_marker(&me);
+                        #[cfg(target_os = "macos")]
+                        let relative_activation = self.retina.relative_activation_point(
+                            &me,
+                            self.display_idx,
+                            is_relative_mouse_active(self.inner.id()),
+                        );
+                        #[cfg(target_os = "macos")]
                         self.retina.on_mouse_event(&mut me, self.display_idx);
+                        #[cfg(target_os = "macos")]
+                        if let Some((x, y)) = relative_activation {
+                            log::info!(
+                                "Relative mouse activation received: conn={}, display={}, target=({}, {})",
+                                self.inner.id(),
+                                self.display_idx,
+                                x,
+                                y
+                            );
+                            self.input_mouse(
+                                MouseEvent {
+                                    x,
+                                    y,
+                                    mask: crate::input::MOUSE_TYPE_MOVE,
+                                    ..Default::default()
+                                },
+                                self.inner.id(),
+                                self.lr.my_name.clone(),
+                                self.peer_argb,
+                                true,
+                                self.show_my_cursor,
+                            );
+                        }
+                        #[cfg(target_os = "macos")]
+                        if relative_activation_marker {
+                            // The zero-delta packet is a control marker, not a
+                            // movement. Forwarding it after the asynchronous
+                            // absolute activation move can read the old macOS
+                            // cursor position and race the pointer back there.
+                            mark_relative_mouse_active(self.inner.id());
+                        }
+                        #[cfg(not(target_os = "macos"))]
                         self.input_mouse(
                             me,
                             self.inner.id(),
@@ -2863,6 +2903,17 @@ impl Connection {
                             true,
                             self.show_my_cursor,
                         );
+                        #[cfg(target_os = "macos")]
+                        if !relative_activation_marker {
+                            self.input_mouse(
+                                me,
+                                self.inner.id(),
+                                self.lr.my_name.clone(),
+                                self.peer_argb,
+                                true,
+                                self.show_my_cursor,
+                            );
+                        }
                     } else if self.show_my_cursor {
                         #[cfg(target_os = "macos")]
                         self.retina.on_mouse_event(&mut me, self.display_idx);
@@ -6359,6 +6410,7 @@ impl Retina {
         if evt_type == crate::input::MOUSE_TYPE_WHEEL
             || evt_type == crate::input::MOUSE_TYPE_TRACKPAD
             || evt_type == crate::input::MOUSE_TYPE_MOVE_RELATIVE
+            || evt_type == crate::input::MOUSE_TYPE_RELATIVE_MODE_OFF
         {
             return;
         }
@@ -6370,6 +6422,24 @@ impl Retina {
             e.x = d.x + ((e.x - d.x) as f64 / s) as i32;
             e.y = d.y + ((e.y - d.y) as f64 / s) as i32;
         }
+    }
+
+    #[inline]
+    fn relative_activation_point(
+        &self,
+        e: &MouseEvent,
+        current: usize,
+        relative_already_active: bool,
+    ) -> Option<(i32, i32)> {
+        if relative_already_active || !is_relative_activation_marker(e) {
+            return None;
+        }
+        // Compatibility clients can forward both the JSON zero-delta marker
+        // and an i32::MAX sentinel. Only the first marker for a connection may
+        // select and center its target display. Re-entry/focus markers are
+        // control no-ops once the connection is active.
+        let cursor = crate::get_cursor_pos()?;
+        relative_activation_point_for_display(self.displays.get(current)?, cursor)
     }
 
     #[inline]
@@ -6393,6 +6463,43 @@ impl Retina {
         }
         None
     }
+}
+
+#[cfg(target_os = "macos")]
+const RELATIVE_ACTIVATION_SENTINEL: i32 = i32::MAX;
+
+#[cfg(target_os = "macos")]
+#[inline]
+fn is_relative_activation_marker(e: &MouseEvent) -> bool {
+    e.mask & crate::input::MOUSE_TYPE_MASK == crate::input::MOUSE_TYPE_MOVE_RELATIVE
+        && ((e.x == 0 && e.y == 0)
+            || (e.x == RELATIVE_ACTIVATION_SENTINEL && e.y == RELATIVE_ACTIVATION_SENTINEL))
+}
+
+#[cfg(target_os = "macos")]
+fn relative_activation_point_for_display(
+    display: &DisplayInfo,
+    cursor: (i32, i32),
+) -> Option<(i32, i32)> {
+    let scale = if display.scale.is_finite() && display.scale > 0.0 {
+        display.scale
+    } else {
+        1.0
+    };
+    let logical_width = ((display.width as f64) / scale).ceil() as i32;
+    let logical_height = ((display.height as f64) / scale).ceil() as i32;
+    if logical_width <= 0 || logical_height <= 0 {
+        return None;
+    }
+    let right = display.x.saturating_add(logical_width);
+    let bottom = display.y.saturating_add(logical_height);
+    if cursor.0 >= display.x && cursor.0 < right && cursor.1 >= display.y && cursor.1 < bottom {
+        return None;
+    }
+    Some((
+        display.x.saturating_add(logical_width / 2),
+        display.y.saturating_add(logical_height / 2),
+    ))
 }
 
 /// Get control permission state from CONTROL_PERMISSIONS_ARRAY.
@@ -6709,6 +6816,74 @@ mod test {
         let pos = msg.cursor_position();
         assert_eq!(pos.x, 510);
         assert_eq!(pos.y, 510);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn relative_input_activates_its_selected_retina_display() {
+        let display = DisplayInfo {
+            x: 1470,
+            y: 1060,
+            width: 2880,
+            height: 1800,
+            scale: 2.0,
+            ..Default::default()
+        };
+        assert_eq!(
+            relative_activation_point_for_display(&display, (735, 478)),
+            Some((2190, 1510))
+        );
+        assert_eq!(
+            relative_activation_point_for_display(&display, (2190, 1510)),
+            None
+        );
+
+        let retina = Retina {
+            displays: vec![display],
+        };
+        let activation_marker = MouseEvent {
+            mask: crate::input::MOUSE_TYPE_MOVE_RELATIVE,
+            ..Default::default()
+        };
+        assert!(is_relative_activation_marker(&activation_marker));
+        assert_eq!(
+            retina.relative_activation_point(&activation_marker, 0, false),
+            Some((2190, 1510))
+        );
+        assert_eq!(
+            retina.relative_activation_point(&activation_marker, 0, true),
+            None
+        );
+
+        let compatibility_activation_marker = MouseEvent {
+            x: RELATIVE_ACTIVATION_SENTINEL,
+            y: RELATIVE_ACTIVATION_SENTINEL,
+            mask: crate::input::MOUSE_TYPE_MOVE_RELATIVE,
+            ..Default::default()
+        };
+        assert!(is_relative_activation_marker(
+            &compatibility_activation_marker
+        ));
+        assert_eq!(
+            retina.relative_activation_point(&compatibility_activation_marker, 0, false),
+            Some((2190, 1510))
+        );
+        assert_eq!(
+            retina.relative_activation_point(&compatibility_activation_marker, 0, true),
+            None
+        );
+
+        let edge_crossing_delta = MouseEvent {
+            x: -12,
+            y: 3,
+            mask: crate::input::MOUSE_TYPE_MOVE_RELATIVE,
+            ..Default::default()
+        };
+        assert!(!is_relative_activation_marker(&edge_crossing_delta));
+        assert_eq!(
+            retina.relative_activation_point(&edge_crossing_delta, 0, false),
+            None
+        );
     }
 
     #[test]

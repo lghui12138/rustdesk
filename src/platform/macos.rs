@@ -80,12 +80,26 @@ extern "C" {
     fn majorVersion() -> u32;
     fn MacGetMode(display: u32, width: *mut u32, height: *mut u32) -> BOOL;
     fn MacSetMode(display: u32, width: u32, height: u32, tryHiDPI: bool) -> BOOL;
+    fn MacInstallReturnToPrimaryDisplayShortcut() -> bool;
     fn CGWarpMouseCursorPosition(newCursorPosition: CGPoint) -> CGError;
     fn CGAssociateMouseAndMouseCursorPosition(connected: BooleanT) -> CGError;
 }
 
 pub fn major_version() -> u32 {
     unsafe { majorVersion() }
+}
+
+pub fn install_return_to_primary_display_shortcut() -> bool {
+    unsafe { MacInstallReturnToPrimaryDisplayShortcut() }
+}
+
+/// Native CoreGraphics shortcut callback. Keep unwinding on the Rust side of
+/// the FFI boundary even if a poisoned lock is encountered.
+#[no_mangle]
+pub extern "C" fn RustDeskReturnToPrimaryDisplayShortcut() -> i32 {
+    std::panic::catch_unwind(crate::server::request_return_to_primary_display)
+        .map(|count| count.min(i32::MAX as usize) as i32)
+        .unwrap_or(0)
 }
 
 pub fn is_process_trusted(prompt: bool) -> bool {
