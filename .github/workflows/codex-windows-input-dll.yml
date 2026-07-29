@@ -1,0 +1,81 @@
+name: Codex Windows input DLL
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  LLVM_VERSION: "15.0.6"
+  RUST_VERSION: "1.75"
+  VCPKG_COMMIT_ID: "120deac3062162151622ca4860575a33844ba10b"
+
+jobs:
+  build-windows-x64-dll:
+    runs-on: windows-2022
+    steps:
+      - name: Export GitHub Actions cache environment variables
+        uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Checkout source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          submodules: recursive
+
+      - name: Install LLVM and Clang
+        uses: KyleMayes/install-llvm-action@ebc0426251bc40c7cd31162802432c68818ab8f0
+        with:
+          version: ${{ env.LLVM_VERSION }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: x86_64-pc-windows-msvc
+          components: rustfmt
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+        with:
+          prefix-key: codex-windows-input-dll
+
+      - name: Set up vcpkg
+        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2
+        with:
+          vcpkgDirectory: C:\vcpkg
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+          doNotCache: false
+
+      - name: Install native dependencies
+        shell: bash
+        env:
+          VCPKG_DEFAULT_HOST_TRIPLET: x64-windows-static
+        run: |
+          "$VCPKG_ROOT/vcpkg" install \
+            --triplet x64-windows-static \
+            --x-install-root="$VCPKG_ROOT/installed"
+
+      - name: Build RustDesk Windows DLL
+        shell: bash
+        run: |
+          cargo build \
+            --locked \
+            --features flutter,hwcodec,vram \
+            --lib \
+            --release
+          test -f target/release/librustdesk.dll
+          sha256sum target/release/librustdesk.dll > target/release/librustdesk.dll.sha256
+
+      - name: Upload unsigned DLL
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: codex-rustdesk-windows-input-dll
+          path: |
+            target/release/librustdesk.dll
+            target/release/librustdesk.dll.sha256
+          if-no-files-found: error

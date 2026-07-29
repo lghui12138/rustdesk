@@ -39,18 +39,37 @@ static KEYBOARD_HOOKED: AtomicBool = AtomicBool::new(false);
 // macOS: Cmd+G (track G key)
 // Windows/Linux: Ctrl+Alt (track whichever modifier was pressed last)
 // This prevents the exit from retriggering on OS key-repeat.
-#[cfg(all(feature = "flutter", any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+#[cfg(all(
+    feature = "flutter",
+    any(target_os = "windows", target_os = "macos", target_os = "linux")
+))]
 static EXIT_SHORTCUT_KEY_DOWN: AtomicBool = AtomicBool::new(false);
+
+// Track the H key for the cross-platform "return to primary display" safety
+// shortcut (Ctrl+Meta+H). This is intentionally independent from the legacy
+// relative-mode exit shortcut so releasing Ctrl/Meta cannot clear the pending
+// H key-up.
+#[cfg(all(
+    feature = "flutter",
+    any(target_os = "windows", target_os = "macos", target_os = "linux")
+))]
+static RETURN_SHORTCUT_KEY_DOWN: AtomicBool = AtomicBool::new(false);
 
 // Track whether relative mouse mode is currently active.
 // This is set by Flutter via set_relative_mouse_mode_state() and checked
 // by the rdev grab loop to determine if exit shortcuts should be processed.
-#[cfg(all(feature = "flutter", any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+#[cfg(all(
+    feature = "flutter",
+    any(target_os = "windows", target_os = "macos", target_os = "linux")
+))]
 static RELATIVE_MOUSE_MODE_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// Set the relative mouse mode state from Flutter.
 /// This is called when entering or exiting relative mouse mode.
-#[cfg(all(feature = "flutter", any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+#[cfg(all(
+    feature = "flutter",
+    any(target_os = "windows", target_os = "macos", target_os = "linux")
+))]
 pub fn set_relative_mouse_mode_state(active: bool) {
     RELATIVE_MOUSE_MODE_ACTIVE.store(active, Ordering::SeqCst);
     // Reset exit shortcut state when mode changes to avoid stale state
@@ -258,6 +277,15 @@ pub mod client {
                                             session_id
                                         );
                                         KEYBOARD_HOOKED.store(false, Ordering::SeqCst);
+                                        #[cfg(all(
+                                            feature = "flutter",
+                                            any(
+                                                target_os = "windows",
+                                                target_os = "macos",
+                                                target_os = "linux"
+                                            )
+                                        ))]
+                                        RETURN_SHORTCUT_KEY_DOWN.store(false, Ordering::SeqCst);
                                         gs.owner = None;
                                         gs.last_grab = None;
                                         Some(to_release)
@@ -291,6 +319,11 @@ pub mod client {
 
                 #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
                 KEYBOARD_HOOKED.store(false, Ordering::SeqCst);
+                #[cfg(all(
+                    feature = "flutter",
+                    any(target_os = "windows", target_os = "macos", target_os = "linux")
+                ))]
+                RETURN_SHORTCUT_KEY_DOWN.store(false, Ordering::SeqCst);
 
                 gs.owner = None;
                 gs.last_grab = None;
@@ -522,6 +555,27 @@ fn is_exit_relative_mouse_shortcut(key: Key) -> bool {
     }
 }
 
+#[cfg(feature = "flutter")]
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+fn is_return_to_primary_display_shortcut_with_modifiers(key: Key, ctrl: bool, meta: bool) -> bool {
+    key == Key::KeyH && ctrl && meta
+}
+
+/// Check the cross-platform return shortcut.
+///
+/// - macOS: Control+Command+H
+/// - Windows/Linux: Control+Meta/Super+H
+#[cfg(feature = "flutter")]
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+fn is_return_to_primary_display_shortcut(key: Key) -> bool {
+    let modifiers = MODIFIERS_STATE.lock().unwrap();
+    let ctrl = *modifiers.get(&Key::ControlLeft).unwrap_or(&false)
+        || *modifiers.get(&Key::ControlRight).unwrap_or(&false);
+    let meta = *modifiers.get(&Key::MetaLeft).unwrap_or(&false)
+        || *modifiers.get(&Key::MetaRight).unwrap_or(&false);
+    is_return_to_primary_display_shortcut_with_modifiers(key, ctrl, meta)
+}
+
 /// Notify Flutter to exit relative mouse mode.
 /// Note: This is Flutter-only. Sciter client does not support relative mouse mode.
 #[cfg(feature = "flutter")]
@@ -529,6 +583,34 @@ fn is_exit_relative_mouse_shortcut(key: Key) -> bool {
 fn notify_exit_relative_mouse_mode() {
     let session_id = flutter::get_cur_session_id();
     flutter::push_session_event(&session_id, "exit_relative_mouse_mode", vec![]);
+}
+
+/// Notify Flutter to release local capture and return the peer cursor to its
+/// primary physical display.
+#[cfg(feature = "flutter")]
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+fn notify_return_to_primary_display() {
+    let session_id = flutter::get_cur_session_id();
+    flutter::push_session_event(&session_id, "return_to_primary_display", vec![]);
+}
+
+#[cfg(feature = "flutter")]
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+#[inline]
+fn can_control_remote_session_from_grab_loop() -> bool {
+    let Some(session) = flutter::get_cur_session() else {
+        return false;
+    };
+
+    if !session.is_default() {
+        return false;
+    }
+
+    if !*session.server_keyboard_enabled.read().unwrap() {
+        return false;
+    }
+    let lc = session.lc.read().unwrap();
+    !lc.view_only.v
 }
 
 /// Handle relative mouse mode shortcuts in the rdev grab loop.
@@ -543,23 +625,13 @@ fn can_exit_relative_mouse_mode_from_grab_loop() -> bool {
         return false;
     }
 
+    if !can_control_remote_session_from_grab_loop() {
+        return false;
+    }
     let Some(session) = flutter::get_cur_session() else {
         return false;
     };
-
-    // Only for remote desktop sessions.
-    if !session.is_default() {
-        return false;
-    }
-
-    // Must have keyboard permission and not be in view-only mode.
-    if !*session.server_keyboard_enabled.read().unwrap() {
-        return false;
-    }
     let lc = session.lc.read().unwrap();
-    if lc.view_only.v {
-        return false;
-    }
 
     // Peer must support relative mouse mode.
     crate::common::is_support_relative_mouse_mode_num(lc.version)
@@ -573,14 +645,28 @@ fn should_block_relative_mouse_shortcut(key: Key, is_press: bool) -> bool {
         return false;
     }
 
+    // The safety shortcut is valid for every controllable desktop session, not
+    // only while relative mode is active. Block the matching H key-up whenever
+    // its key-down was consumed so the peer never receives an orphan release.
+    if key == Key::KeyH && !is_press && RETURN_SHORTCUT_KEY_DOWN.swap(false, Ordering::SeqCst) {
+        return true;
+    }
+    if is_press && is_return_to_primary_display_shortcut(key) {
+        if !can_control_remote_session_from_grab_loop() {
+            return false;
+        }
+        if !RETURN_SHORTCUT_KEY_DOWN.swap(true, Ordering::SeqCst) {
+            notify_return_to_primary_display();
+        }
+        return true;
+    }
+
     // Determine which key to track for key-up blocking based on platform
     #[cfg(target_os = "macos")]
     let is_tracked_key = key == Key::KeyG;
     #[cfg(not(target_os = "macos"))]
-    let is_tracked_key = key == Key::ControlLeft
-        || key == Key::ControlRight
-        || key == Key::Alt
-        || key == Key::AltGr;
+    let is_tracked_key =
+        key == Key::ControlLeft || key == Key::ControlRight || key == Key::Alt || key == Key::AltGr;
 
     // Block key up if key down was blocked (to avoid orphan key up event on remote).
     // This must be checked before clearing the flag below.
@@ -607,6 +693,39 @@ fn should_block_relative_mouse_shortcut(key: Key, is_press: bool) -> bool {
     }
 
     false
+}
+
+#[cfg(test)]
+#[cfg(all(
+    feature = "flutter",
+    any(target_os = "windows", target_os = "macos", target_os = "linux")
+))]
+mod shortcut_tests {
+    use super::*;
+
+    #[test]
+    fn return_to_primary_requires_h_control_and_meta() {
+        assert!(is_return_to_primary_display_shortcut_with_modifiers(
+            Key::KeyH,
+            true,
+            true
+        ));
+        assert!(!is_return_to_primary_display_shortcut_with_modifiers(
+            Key::KeyH,
+            true,
+            false
+        ));
+        assert!(!is_return_to_primary_display_shortcut_with_modifiers(
+            Key::KeyH,
+            false,
+            true
+        ));
+        assert!(!is_return_to_primary_display_shortcut_with_modifiers(
+            Key::KeyG,
+            true,
+            true
+        ));
+    }
 }
 
 fn start_grab_loop() {
