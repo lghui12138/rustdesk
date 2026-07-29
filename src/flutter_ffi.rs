@@ -1902,16 +1902,17 @@ pub fn session_send_pointer(session_id: SessionID, msg: String) {
 /// The server (via `input_service.rs`) only consumes forwarded delta movements and tracks
 /// relative movement processing state, but does NOT control mode activation/deactivation.
 ///
-/// **Deactivation Markers are Local-Only:**
-/// Deactivation markers (`relative_mouse_mode: "0"`) are NEVER forwarded to the server.
-/// They are handled entirely on the client side to reset local UI state (cursor visibility,
-/// pointer lock, etc.). The server does not rely on deactivation markers and should not
-/// expect to receive them.
+/// **Deactivation Markers are Explicit:**
+/// Deactivation markers (`relative_mouse_mode: "0"`) update local state and send
+/// `MOUSE_TYPE_RELATIVE_MODE_OFF` to the peer. The peer must see an explicit exit
+/// before accepting absolute movement again; otherwise a fullscreen focus frame
+/// can look like an unintended mode switch and move the remote cursor.
 ///
 /// **Contract (Flutter side MUST adhere to):**
 /// 1. `relative_mouse_mode` field is ONLY present on activation/deactivation marker messages,
 ///    NEVER on normal pointer events (move, button, scroll).
-/// 2. Deactivation marker: `{"relative_mouse_mode": "0"}` - local-only, never forwarded.
+/// 2. Deactivation marker: `{"relative_mouse_mode": "0"}` - forwarded as a
+///    zero-coordinate `MOUSE_TYPE_RELATIVE_MODE_OFF` control event.
 /// 3. Activation marker: `{"relative_mouse_mode": "1", "type": "move_relative", "x": "0", "y": "0"}`
 ///    - MUST use `type="move_relative"` with `x="0"` and `y="0"` (safe no-op).
 ///    - Any other combination is dropped to prevent accidental cursor movement.
@@ -1927,12 +1928,22 @@ pub fn session_send_mouse(session_id: SessionID, msg: String) {
         if let Some(v) = m.get("relative_mouse_mode") {
             let active = matches!(v.as_str(), "1" | "Y" | "on");
 
-            // Disable marker: local-only, never forwarded to the server.
-            // The server does not track mode deactivation; it simply stops receiving
-            // relative move events when the client exits relative mouse mode.
+            // Disable marker: update the local grab loop and explicitly tell the
+            // peer to leave relative mode before any absolute movement is allowed.
             if !active {
                 #[cfg(not(any(target_os = "android", target_os = "ios")))]
                 crate::keyboard::set_relative_mouse_mode_state(false);
+                if let Some(session) = sessions::get_session_by_session_id(&session_id) {
+                    session.send_mouse(
+                        MOUSE_TYPE_RELATIVE_MODE_OFF,
+                        0,
+                        0,
+                        false,
+                        false,
+                        false,
+                        false,
+                    );
+                }
                 return;
             }
 
@@ -3030,8 +3041,7 @@ pub fn main_set_common(_key: String, _value: String) {
 
 pub fn session_set_common(session_id: SessionID, key: String, value: String) {
     if let Some(s) = sessions::get_session_by_session_id(&session_id) {
-        if key == "continue-insecure-connection"
-        {
+        if key == "continue-insecure-connection" {
             s.continue_insecure_connection(value == "Y");
             return;
         }
