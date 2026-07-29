@@ -1,23 +1,45 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <commctrl.h>
 
 #define CODEX_MAX_HOOKS 64
+#define CODEX_CURSOR_SUBCLASS_ID 0x434F444558435552ULL
 
 typedef struct CodexCursorHook {
   HWND window;
-  WNDPROC previous;
 } CodexCursorHook;
 
 static CodexCursorHook g_hooks[CODEX_MAX_HOOKS];
 static volatile LONG g_hook_count = 0;
 static volatile LONG g_hidden = 0;
 static HCURSOR g_previous_cursor = NULL;
+static HWINEVENTHOOK g_window_event_hook = NULL;
+
+static void CodexUntrackWindow(HWND window) {
+  LONG count = InterlockedCompareExchange(&g_hook_count, 0, 0);
+  for (LONG index = 0; index < count; ++index) {
+    if (g_hooks[index].window != window) {
+      continue;
+    }
+    for (LONG next = index + 1; next < count; ++next) {
+      g_hooks[next - 1] = g_hooks[next];
+    }
+    g_hooks[count - 1].window = NULL;
+    InterlockedExchange(&g_hook_count, count - 1);
+    return;
+  }
+}
 
 static LRESULT CALLBACK CodexCursorGuardProc(
     HWND window,
     UINT message,
     WPARAM wparam,
-    LPARAM lparam) {
+    LPARAM lparam,
+    UINT_PTR subclass_id,
+    DWORD_PTR reference_data) {
+  (void)subclass_id;
+  (void)reference_data;
+
   if (InterlockedCompareExchange(&g_hidden, 0, 0) != 0 &&
       message == WM_SETCURSOR &&
       LOWORD(lparam) == HTCLIENT) {
@@ -25,63 +47,50 @@ static LRESULT CALLBACK CodexCursorGuardProc(
     return TRUE;
   }
 
-  LONG count = InterlockedCompareExchange(&g_hook_count, 0, 0);
-  for (LONG index = 0; index < count; ++index) {
-    if (g_hooks[index].window == window && g_hooks[index].previous != NULL) {
-      LRESULT result = CallWindowProcW(
-          g_hooks[index].previous,
-          window,
-          message,
-          wparam,
-          lparam);
-      /*
-       * Flutter or a cursor plugin may call SetCursor while processing the
-       * movement itself. Reassert after the original window procedure so the
-       * local hardware arrow cannot be painted over the remote cursor.
-       */
-      if (InterlockedCompareExchange(&g_hidden, 0, 0) != 0 &&
-          message == WM_MOUSEMOVE) {
-        SetCursor(NULL);
-      }
-      return result;
-    }
+  LRESULT result = DefSubclassProc(window, message, wparam, lparam);
+  /*
+   * Flutter or a cursor plugin may call SetCursor while processing the
+   * movement itself. Reassert after the original subclass chain so the local
+   * hardware arrow cannot be painted over the remote cursor.
+   */
+  if (InterlockedCompareExchange(&g_hidden, 0, 0) != 0 &&
+      message == WM_MOUSEMOVE) {
+    SetCursor(NULL);
   }
-  return DefWindowProcW(window, message, wparam, lparam);
+  if (message == WM_NCDESTROY) {
+    RemoveWindowSubclass(
+        window,
+        CodexCursorGuardProc,
+        CODEX_CURSOR_SUBCLASS_ID);
+    CodexUntrackWindow(window);
+  }
+  return result;
 }
 
 static BOOL CodexHookWindow(HWND window) {
   LONG count = InterlockedCompareExchange(&g_hook_count, 0, 0);
   for (LONG index = 0; index < count; ++index) {
     if (g_hooks[index].window == window) {
-      return TRUE;
+      return SetWindowSubclass(
+          window,
+          CodexCursorGuardProc,
+          CODEX_CURSOR_SUBCLASS_ID,
+          0);
     }
   }
   if (count >= CODEX_MAX_HOOKS) {
     return FALSE;
   }
-
-  SetLastError(ERROR_SUCCESS);
-  WNDPROC previous =
-      (WNDPROC)GetWindowLongPtrW(window, GWLP_WNDPROC);
-  if (previous == NULL && GetLastError() != ERROR_SUCCESS) {
+  if (!SetWindowSubclass(
+          window,
+          CodexCursorGuardProc,
+          CODEX_CURSOR_SUBCLASS_ID,
+          0)) {
     return FALSE;
   }
 
   g_hooks[count].window = window;
-  g_hooks[count].previous = previous;
   InterlockedExchange(&g_hook_count, count + 1);
-
-  SetLastError(ERROR_SUCCESS);
-  LONG_PTR replaced = SetWindowLongPtrW(
-      window,
-      GWLP_WNDPROC,
-      (LONG_PTR)CodexCursorGuardProc);
-  if (replaced == 0 && GetLastError() != ERROR_SUCCESS) {
-    InterlockedExchange(&g_hook_count, count);
-    g_hooks[count].window = NULL;
-    g_hooks[count].previous = NULL;
-    return FALSE;
-  }
   return TRUE;
 }
 
@@ -108,20 +117,50 @@ static BOOL CALLBACK CodexHookTopLevelWindow(HWND window, LPARAM lparam) {
   return TRUE;
 }
 
+static void CALLBACK CodexWindowEventProc(
+    HWINEVENTHOOK hook,
+    DWORD event,
+    HWND window,
+    LONG object_id,
+    LONG child_id,
+    DWORD event_thread,
+    DWORD event_time) {
+  (void)hook;
+  (void)child_id;
+  (void)event_thread;
+  (void)event_time;
+
+  if (InterlockedCompareExchange(&g_hidden, 0, 0) == 0 ||
+      window == NULL ||
+      (event != EVENT_OBJECT_CREATE && event != EVENT_OBJECT_SHOW) ||
+      (object_id != OBJID_WINDOW && object_id != OBJID_CLIENT)) {
+    return;
+  }
+  DWORD window_process = 0;
+  GetWindowThreadProcessId(window, &window_process);
+  if (window_process != GetCurrentProcessId()) {
+    return;
+  }
+  CodexHookWindow(window);
+  EnumChildWindows(window, CodexHookChildWindow, 0);
+  SetCursor(NULL);
+}
+
 static void CodexRestoreHooks(void) {
+  if (g_window_event_hook != NULL) {
+    UnhookWinEvent(g_window_event_hook);
+    g_window_event_hook = NULL;
+  }
   LONG count = InterlockedCompareExchange(&g_hook_count, 0, 0);
   for (LONG index = count - 1; index >= 0; --index) {
     HWND window = g_hooks[index].window;
-    WNDPROC previous = g_hooks[index].previous;
-    if (window != NULL && previous != NULL && IsWindow(window)) {
-      WNDPROC current =
-          (WNDPROC)GetWindowLongPtrW(window, GWLP_WNDPROC);
-      if (current == CodexCursorGuardProc) {
-        SetWindowLongPtrW(window, GWLP_WNDPROC, (LONG_PTR)previous);
-      }
+    if (window != NULL && IsWindow(window)) {
+      RemoveWindowSubclass(
+          window,
+          CodexCursorGuardProc,
+          CODEX_CURSOR_SUBCLASS_ID);
     }
     g_hooks[index].window = NULL;
-    g_hooks[index].previous = NULL;
   }
   InterlockedExchange(&g_hook_count, 0);
 }
@@ -132,6 +171,14 @@ __declspec(dllexport) int __cdecl codex_cursor_guard_set_hidden(int hidden) {
         InterlockedCompareExchange(&g_hidden, 1, 0) == 0;
     if (first_hide) {
       InterlockedExchange(&g_hook_count, 0);
+      g_window_event_hook = SetWinEventHook(
+          EVENT_OBJECT_CREATE,
+          EVENT_OBJECT_SHOW,
+          NULL,
+          CodexWindowEventProc,
+          GetCurrentProcessId(),
+          0,
+          WINEVENT_OUTOFCONTEXT);
     }
     /*
      * Fullscreen Flutter can create or replace child HWNDs after relative
