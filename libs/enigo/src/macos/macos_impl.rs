@@ -4,6 +4,7 @@ use core_graphics;
 use self::core_graphics::display::*;
 use self::core_graphics::event::*;
 use self::core_graphics::event_source::*;
+use self::core_graphics::geometry::CGRect;
 use std::collections::HashMap as Map;
 use std::ffi::c_void;
 use std::ffi::CStr;
@@ -75,6 +76,8 @@ extern "C" {
     ) -> Boolean;
 
     fn CGEventPost(tapLocation: CGEventTapLocation, event: *mut MyCGEvent);
+    fn CGEventCreate(source: *mut c_void) -> *mut MyCGEvent;
+    fn CGEventGetLocation(event: *const MyCGEvent) -> CGPoint;
     // Actually return CFDataRef which is const here, but for coding convenience, return *mut c_void
     fn TISGetInputSourceProperty(source: TISInputSourceRef, property: *const c_void)
         -> *mut c_void;
@@ -87,13 +90,12 @@ extern "C" {
         ...
     ) -> *mut MyCGEvent;
     fn CGEventSourceKeyState(stateID: i32, key: u16) -> bool;
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct NSPoint {
-    x: f64,
-    y: f64,
+    fn CGGetActiveDisplayList(
+        max_displays: u32,
+        active_displays: *mut u32,
+        display_count: *mut u32,
+    ) -> i32;
+    fn CGDisplayBounds(display: u32) -> CGRect;
 }
 
 // not present in servo/core-graphics
@@ -214,44 +216,8 @@ impl MouseControllable for Enigo {
     }
 
     fn mouse_move_relative(&mut self, x: i32, y: i32) {
-        let (display_width, display_height) = Self::main_display_size();
-        let (current_x, y_inv) = Self::mouse_location_raw_coords();
-        let current_y = (display_height as i32) - y_inv;
-        // Use saturating arithmetic to prevent overflow/wraparound
-        let mut new_x = current_x.saturating_add(x);
-        let mut new_y = current_y.saturating_add(y);
-
-        // Define screen center and edge margins for cursor reset
-        let center_x = (display_width / 2) as i32;
-        let center_y = (display_height / 2) as i32;
-        // Margin calculation: 5% of the smaller screen dimension with a minimum of 50px.
-        // This provides a comfortable buffer zone to detect when the cursor is approaching
-        // screen edges, allowing us to reset it to center before it hits the boundary.
-        // This ensures continuous relative mouse movement without getting stuck at edges.
-        let margin = (display_width.min(display_height) / 20).max(50) as i32;
-
-        // Check if cursor is approaching screen boundaries
-        // Use saturating_sub to prevent negative thresholds on very small displays
-        let right = (display_width as i32).saturating_sub(margin);
-        let bottom = (display_height as i32).saturating_sub(margin);
-        let near_edge = new_x < margin
-            || new_x > right
-            || new_y < margin
-            || new_y > bottom;
-
-        if near_edge {
-            // Reset cursor to screen center to allow continuous movement
-            // The delta values are still passed correctly for games/apps
-            new_x = center_x;
-            new_y = center_y;
-        }
-
-        // Clamp to screen bounds as a safety measure.
-        // Use saturating_sub(1) to ensure coordinates don't exceed the last valid pixel.
-        let max_x = (display_width as i32).saturating_sub(1).max(0);
-        let max_y = (display_height as i32).saturating_sub(1).max(0);
-        new_x = new_x.clamp(0, max_x);
-        new_y = new_y.clamp(0, max_y);
+        let current = Self::mouse_location();
+        let (new_x, new_y) = relative_target(current, (x, y), &Self::active_display_bounds());
 
         // Pass delta values for relative movement
         // This is critical for browser Pointer Lock API support
@@ -510,9 +476,7 @@ impl Enigo {
 
         let dest = CGPoint::new(x as f64, y as f64);
         if let Some(src) = self.event_source.as_ref() {
-            if let Ok(event) =
-                CGEvent::new_mouse_event(src.clone(), event_type, dest, button)
-            {
+            if let Ok(event) = CGEvent::new_mouse_event(src.clone(), event_type, dest, button) {
                 // Set delta fields for relative mouse movement
                 // This is essential for Pointer Lock API in browsers
                 if let Some((dx, dy)) = delta {
@@ -532,24 +496,60 @@ impl Enigo {
         (width, height)
     }
 
-    /// Returns the current mouse location in Cocoa coordinates which have Y
-    /// inverted from the Carbon coordinates used in the rest of the API.
-    /// This function exists so that mouse_move_relative only has to fetch
-    /// the screen size once.
-    fn mouse_location_raw_coords() -> (i32, i32) {
-        if let Some(ns_event) = Class::get("NSEvent") {
-            let pt: NSPoint = unsafe { msg_send![ns_event, mouseLocation] };
-            (pt.x as i32, pt.y as i32)
+    fn active_display_bounds() -> Vec<(i32, i32, i32, i32)> {
+        const MAX_DISPLAYS: usize = 32;
+        let mut display_ids = [0_u32; MAX_DISPLAYS];
+        let mut display_count = 0_u32;
+        let error = unsafe {
+            CGGetActiveDisplayList(
+                MAX_DISPLAYS as u32,
+                display_ids.as_mut_ptr(),
+                &mut display_count,
+            )
+        };
+        if error == 0 && display_count > 0 {
+            let mut bounds = Vec::with_capacity(display_count as usize);
+            for display_id in display_ids.iter().take(display_count as usize) {
+                let rect = unsafe { CGDisplayBounds(*display_id) };
+                let left = rect.origin.x.floor() as i32;
+                let top = rect.origin.y.floor() as i32;
+                let right = (rect.origin.x + rect.size.width).ceil() as i32;
+                let bottom = (rect.origin.y + rect.size.height).ceil() as i32;
+                if right > left && bottom > top {
+                    bounds.push((left, top, right, bottom));
+                }
+            }
+            if !bounds.is_empty() {
+                return bounds;
+            }
+        }
+
+        let rect = unsafe { CGDisplayBounds(CGMainDisplayID()) };
+        let left = rect.origin.x.floor() as i32;
+        let top = rect.origin.y.floor() as i32;
+        let right = (rect.origin.x + rect.size.width).ceil() as i32;
+        let bottom = (rect.origin.y + rect.size.height).ceil() as i32;
+        if right > left && bottom > top {
+            vec![(left, top, right, bottom)]
         } else {
-            (0, 0)
+            let (width, height) = Self::main_display_size();
+            vec![(0, 0, width as i32, height as i32)]
         }
     }
 
-    /// The mouse coordinates in points, only works on the main display
+    /// Returns the cursor in global Quartz logical points. These coordinates
+    /// share the same top-left origin and units as `CGDisplayBounds`, including
+    /// on mixed-scale multi-display desktops.
     pub fn mouse_location() -> (i32, i32) {
-        let (x, y_inv) = Self::mouse_location_raw_coords();
-        let (_, display_height) = Self::main_display_size();
-        (x, (display_height as i32) - y_inv)
+        unsafe {
+            let event = CGEventCreate(null_mut());
+            if event.is_null() {
+                return (0, 0);
+            }
+            let point = CGEventGetLocation(event);
+            CFRelease(event as *const c_void);
+            (point.x as i32, point.y as i32)
+        }
     }
 
     fn key_to_keycode(&mut self, key: Key) -> CGKeyCode {
@@ -763,6 +763,88 @@ impl Enigo {
     /// handle scroll horizontally
     pub fn mouse_scroll_x(&mut self, length: i32, is_track_pad: bool) {
         self.mouse_scroll_impl(length, is_track_pad, true)
+    }
+}
+
+fn nearest_point_on_displays(x: i32, y: i32, displays: &[(i32, i32, i32, i32)]) -> (i32, i32) {
+    let mut nearest = (x, y);
+    let mut nearest_distance = i64::MAX;
+    for &(left, top, right, bottom) in displays {
+        if right <= left || bottom <= top {
+            continue;
+        }
+        let candidate_x = x.clamp(left, right.saturating_sub(1));
+        let candidate_y = y.clamp(top, bottom.saturating_sub(1));
+        let dx = i64::from(candidate_x) - i64::from(x);
+        let dy = i64::from(candidate_y) - i64::from(y);
+        let distance = dx.saturating_mul(dx).saturating_add(dy.saturating_mul(dy));
+        if distance < nearest_distance {
+            nearest = (candidate_x, candidate_y);
+            nearest_distance = distance;
+        }
+    }
+    nearest
+}
+
+fn relative_target(
+    current: (i32, i32),
+    delta: (i32, i32),
+    displays: &[(i32, i32, i32, i32)],
+) -> (i32, i32) {
+    nearest_point_on_displays(
+        current.0.saturating_add(delta.0),
+        current.1.saturating_add(delta.1),
+        displays,
+    )
+}
+
+#[cfg(test)]
+mod codex_relative_mouse_tests {
+    use super::{nearest_point_on_displays, relative_target};
+
+    const MIXED_SCALE_DESKTOP: [(i32, i32, i32, i32); 2] =
+        [(0, 0, 1470, 956), (1470, 0, 3166, 1060)];
+
+    #[test]
+    fn applies_a_small_delta_on_the_retina_main_display_without_a_scale_jump() {
+        assert_eq!(
+            relative_target((735, 478), (24, 16), &MIXED_SCALE_DESKTOP),
+            (759, 494)
+        );
+    }
+
+    #[test]
+    fn applies_a_small_delta_on_the_adjacent_display_without_a_scale_jump() {
+        assert_eq!(
+            relative_target((2318, 530), (24, 16), &MIXED_SCALE_DESKTOP),
+            (2342, 546)
+        );
+    }
+
+    #[test]
+    fn crosses_from_main_display_into_an_adjacent_display() {
+        assert_eq!(
+            relative_target((1465, 478), (24, 0), &MIXED_SCALE_DESKTOP),
+            (1489, 478)
+        );
+    }
+
+    #[test]
+    fn maps_a_gap_to_the_nearest_physical_display() {
+        let displays = [(0, 0, 1470, 956), (1470, 1060, 2910, 1960)];
+        assert_eq!(
+            nearest_point_on_displays(1600, 1000, &displays),
+            (1600, 1060)
+        );
+    }
+
+    #[test]
+    fn clamps_only_at_the_outer_physical_desktop_edge() {
+        let displays = [(-1920, 0, 0, 1080), (0, 0, 1470, 956)];
+        assert_eq!(
+            nearest_point_on_displays(-2500, 400, &displays),
+            (-1920, 400)
+        );
     }
 }
 
